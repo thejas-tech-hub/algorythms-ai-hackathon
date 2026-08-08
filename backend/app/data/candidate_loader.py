@@ -1,63 +1,106 @@
-"""
-Concrete CandidateRepository — reads from JSON files on disk.
-Owner: MOHAMMED
-
-Loads candidates.json once at startup, builds an in-memory index
-for O(1) lookups by candidate ID.
-"""
+"""Pydantic schemas and loaders for candidate and curriculum JSON data."""
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
+from typing import Any
 
-from app.models.candidate import CandidateDetail
-from app.core.logging import get_logger
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-logger = get_logger(__name__)
+from .json_loader import load_json_model
 
 
-class JSONCandidateLoader:
-    """
-    Loads candidate data from a JSON file and provides lookup methods.
+class DataRecord(BaseModel):
+    """Permit source metadata while validating fields used by the application."""
 
-    Implements the CandidateRepository protocol defined in repositories.py.
-    """
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
 
-    def __init__(self, candidates_path: Path) -> None:
-        self._path = candidates_path
-        self._candidates: list[CandidateDetail] = []
-        self._index: dict[str, CandidateDetail] = {}
-        self._loaded: bool = False
 
-    def load(self) -> None:
-        """Read and parse the candidates JSON file into memory."""
-        logger.info("Loading candidates from %s", self._path)
+class TopicProgress(DataRecord):
+    """A candidate's recorded progress for one curriculum topic."""
 
-        if not self._path.exists():
-            logger.error("Candidates file not found: %s", self._path)
-            raise FileNotFoundError(f"Candidates file not found: {self._path}")
+    topic_id: str
+    status: str | None = None
+    score: float | None = Field(default=None, ge=0, le=100)
 
-        with open(self._path, encoding="utf-8") as f:
-            raw = json.load(f)
+    @model_validator(mode="before")
+    @classmethod
+    def normalise_source_fields(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        record = dict(value)
+        record.setdefault("topic_id", record.get("topicId", record.get("id")))
+        return record
 
-        self._candidates = [
-            CandidateDetail.model_validate(entry)
-            for entry in raw["candidates"]
-        ]
-        self._index = {c.member.id: c for c in self._candidates}
-        self._loaded = True
-        logger.info("Loaded %d candidates successfully", len(self._candidates))
 
-    @property
-    def is_loaded(self) -> bool:
-        """Whether the data file has been loaded into memory."""
-        return self._loaded
+class Candidate(DataRecord):
+    """Validated candidate profile read from ``candidates.json``."""
 
-    def get_all(self) -> list[CandidateDetail]:
-        """Return all candidates."""
-        return self._candidates
+    candidate_id: str
+    name: str | None = None
+    email: str | None = None
+    topic_progress: list[TopicProgress] = Field(default_factory=list)
+    completed_topics: list[str] = Field(default_factory=list)
+    weak_topics: list[str] = Field(default_factory=list)
+    skipped_topics: list[str] = Field(default_factory=list)
 
-    def get_by_id(self, candidate_id: str) -> CandidateDetail | None:
-        """Return a single candidate by ID, or None if not found."""
-        return self._index.get(candidate_id)
+    @model_validator(mode="before")
+    @classmethod
+    def normalise_source_fields(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        record = dict(value)
+        record.setdefault("candidate_id", record.get("candidateId", record.get("id")))
+        record.setdefault("topic_progress", record.get("topicProgress", record.get("progress", [])))
+        record.setdefault("completed_topics", record.get("completedTopics", []))
+        record.setdefault("weak_topics", record.get("weakTopics", []))
+        record.setdefault("skipped_topics", record.get("skippedTopics", []))
+        return record
+
+
+class CandidatesDocument(DataRecord):
+    """Accepted root shape for ``candidates.json``."""
+
+    candidates: list[Candidate]
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalise_root(cls, value: Any) -> Any:
+        return {"candidates": value} if isinstance(value, list) else value
+
+
+class CurriculumTopic(DataRecord):
+    """Validated curriculum topic read from ``curriculum.json``."""
+
+    topic_id: str
+    title: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalise_source_fields(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        record = dict(value)
+        record.setdefault("topic_id", record.get("topicId", record.get("id")))
+        record.setdefault("title", record.get("name"))
+        return record
+
+
+class CurriculumDocument(DataRecord):
+    """Accepted root shape for ``curriculum.json``."""
+
+    topics: list[CurriculumTopic]
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalise_root(cls, value: Any) -> Any:
+        return {"topics": value} if isinstance(value, list) else value
+
+
+def load_candidates() -> list[Candidate]:
+    """Read and validate the application's ``candidates.json`` file."""
+    return load_json_model("candidates.json", CandidatesDocument).candidates
+
+
+def load_curriculum() -> list[CurriculumTopic]:
+    """Read and validate the application's ``curriculum.json`` file."""
+    return load_json_model("curriculum.json", CurriculumDocument).topics

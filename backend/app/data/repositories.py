@@ -1,44 +1,41 @@
-"""
-Abstract repository interfaces (protocols).
-Owner: MOHAMMED
-
-Defines data-access contracts so services depend on abstractions,
-not on concrete storage implementations.
-"""
+"""Read-only repositories over the application JSON data files."""
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
-
-from app.models.candidate import CandidateDetail
-from app.models.interview import InterviewSession
+from .candidate_loader import Candidate, CurriculumTopic, load_candidates, load_curriculum
 
 
-@runtime_checkable
-class CandidateRepository(Protocol):
-    """Contract for candidate data access."""
+class CandidateRepository:
+    """Provide indexed, read-only access to candidates and their topic state."""
 
-    def get_all(self) -> list[CandidateDetail]:
-        """Return all candidates."""
-        ...
+    def __init__(self, candidates: list[Candidate] | None = None) -> None:
+        source = candidates if candidates is not None else load_candidates()
+        self._by_id = {candidate.candidate_id: candidate for candidate in source}
+        if len(self._by_id) != len(source):
+            raise ValueError("candidates.json contains duplicate candidate_id values")
 
-    def get_by_id(self, candidate_id: str) -> CandidateDetail | None:
-        """Return a single candidate by ID, or None if not found."""
-        ...
+    def get_by_id(self, candidate_id: str) -> Candidate | None:
+        """Return a candidate, or ``None`` when no matching ID exists."""
+        return self._by_id.get(candidate_id)
+
+    def list_all(self) -> list[Candidate]:
+        """Return candidates in the order supplied by the source JSON."""
+        return list(self._by_id.values())
 
 
-@runtime_checkable
-class SessionRepository(Protocol):
-    """Contract for interview session persistence."""
+class CurriculumRepository:
+    """Provide indexed, read-only access to curriculum topics."""
 
-    def save(self, session: InterviewSession) -> None:
-        """Persist or update a session."""
-        ...
+    def __init__(self, topics: list[CurriculumTopic] | None = None) -> None:
+        source = topics if topics is not None else load_curriculum()
+        self._by_id = {topic.topic_id: topic for topic in source}
+        if len(self._by_id) != len(source):
+            raise ValueError("curriculum.json contains duplicate topic_id values")
 
-    def get(self, session_id: str) -> InterviewSession | None:
-        """Retrieve a session by ID, or None if not found."""
-        ...
+    def get_by_id(self, topic_id: str) -> CurriculumTopic | None:
+        """Return a curriculum topic, or ``None`` when no matching ID exists."""
+        return self._by_id.get(topic_id)
 
-    def list_by_candidate(self, candidate_id: str) -> list[InterviewSession]:
-        """List all sessions for a given candidate."""
-        ...
+    def list_all(self) -> list[CurriculumTopic]:
+        """Return curriculum topics in the order supplied by the source JSON."""
+        return list(self._by_id.values())
