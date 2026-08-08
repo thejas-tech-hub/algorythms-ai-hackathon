@@ -49,7 +49,11 @@ class Candidate(DataRecord):
         if not isinstance(value, dict):
             return value
         record = dict(value)
-        record.setdefault("candidate_id", record.get("candidateId", record.get("id")))
+        # The actual JSON nests the ID inside "member.id"
+        member = record.get("member")
+        member_id = member.get("id") if isinstance(member, dict) else None
+        record.setdefault("candidate_id", record.get("candidateId", record.get("id", member_id)))
+        record.setdefault("name", member.get("name") if isinstance(member, dict) else None)
         record.setdefault("topic_progress", record.get("topicProgress", record.get("progress", [])))
         record.setdefault("completed_topics", record.get("completedTopics", []))
         record.setdefault("weak_topics", record.get("weakTopics", []))
