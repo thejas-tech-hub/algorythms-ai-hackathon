@@ -11,21 +11,38 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+import re
 
+from app.core.exceptions import SessionExpiredError, SessionNotFoundError
+from app.core.logging import get_logger
+from app.data.repositories import CurriculumRepository
 from app.data.session_store import SessionStore
+from app.models.adaptive import (
+    AdaptiveAction,
+    AdaptiveDecision,
+    AnswerEvaluation,
+    CandidateIntelligenceProfile,
+    QuestionPlan,
+    QuestionType,
+)
+from app.models.common import DifficultyLevel, InterviewStatus
 from app.models.interview import (
+    CandidateAnswer,
+    InterviewMessage,
     InterviewSession,
     InterviewSessionCreate,
-    InterviewMessage,
     InterviewSummary,
-    CandidateAnswer,
 )
-from app.models.common import InterviewStatus
 from app.services.candidate_service import CandidateService
-from app.core.exceptions import SessionNotFoundError, SessionExpiredError
-from app.core.logging import get_logger
+from app.services.curriculum_retrieval import LocalCurriculumRetriever
 
 logger = get_logger(__name__)
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _tokenize(text: str) -> set[str]:
+    return {token for token in _TOKEN_RE.findall(text.casefold()) if len(token) > 2}
 
 
 class InterviewService:
@@ -57,6 +74,402 @@ class InterviewService:
             return None
         return InterviewSession.model_validate(data)
 
+    def _build_candidate_intelligence(
+        self,
+        candidate,
+        selected_topic_id: str,
+        suggested_difficulty: DifficultyLevel,
+    ) -> CandidateIntelligenceProfile:
+        completed_topics = [topic_id for topic_id in candidate.completed_topics if topic_id]
+        curriculum_topics = CurriculumRepository().list_all()
+        completion_rate = 0.0
+        if curriculum_topics:
+            completion_rate = min(1.0, len(completed_topics) / len(curriculum_topics))
+
+        return CandidateIntelligenceProfile(
+            candidate_id=candidate.candidate_id,
+            strengths=list(completed_topics[:3]),
+            weaknesses=list(candidate.weak_topics[:3]),
+            skipped_areas=list(candidate.skipped_topics[:3]),
+            completion_rate=round(completion_rate, 3),
+            suggested_start_difficulty=suggested_difficulty,
+            suggested_focus_areas=list(completed_topics[:3]) or [selected_topic_id],
+            raw_signals={
+                "completed_topics": completed_topics,
+                "topic_progress": [topic.topic_id for topic in getattr(candidate, "topic_progress", [])],
+            },
+        )
+
+    @staticmethod
+    def _topic_name(topic) -> str:
+        return topic.title or topic.topic_id
+
+    @staticmethod
+    def _difficulty_step(current: DifficultyLevel, direction: int) -> DifficultyLevel:
+        ordered = [
+            DifficultyLevel.FOUNDATIONAL,
+            DifficultyLevel.INTERMEDIATE,
+            DifficultyLevel.ADVANCED,
+            DifficultyLevel.EXPERT,
+        ]
+        index = ordered.index(current) + direction
+        index = max(0, min(len(ordered) - 1, index))
+        return ordered[index]
+
+    def _evaluate_answer(
+        self,
+        answer_text: str,
+        question_plan: QuestionPlan,
+        topic_name: str,
+    ) -> AnswerEvaluation:
+        normalized_answer = answer_text.strip()
+        answer_tokens = _tokenize(normalized_answer)
+        context_tokens = _tokenize(
+            " ".join(
+                [
+                    question_plan.objective,
+                    question_plan.topic_context,
+                    topic_name,
+                    " ".join(question_plan.expected_criteria),
+                ]
+            )
+        )
+
+        overlap = len(answer_tokens & context_tokens)
+        word_count = len(answer_tokens)
+        score = min(10.0, round((word_count / 8.0) + (overlap * 1.4), 2))
+
+        lowered = normalized_answer.casefold()
+        if any(marker in lowered for marker in ("example", "because", "trade-off", "tradeoff", "edge case")):
+            score = min(10.0, score + 0.6)
+        if any(marker in lowered for marker in ("implement", "architecture", "complexity", "latency", "workflow")):
+            score = min(10.0, score + 0.4)
+
+        strengths: list[str] = []
+        weaknesses: list[str] = []
+        if overlap:
+            strengths.append(f"Referenced {overlap} relevant concept(s) from the current topic")
+        if word_count >= 18:
+            strengths.append("Provided enough detail to support a deeper follow-up")
+        else:
+            weaknesses.append("Answer is short and could include more technical detail")
+        if score >= 7.0:
+            strengths.append("Demonstrated solid understanding of the topic")
+        else:
+            weaknesses.append("The answer did not yet demonstrate the core concept clearly")
+
+        return AnswerEvaluation(
+            evaluation_id=f"eval-{uuid.uuid4().hex[:8]}",
+            plan_id=question_plan.plan_id,
+            competency_id=question_plan.competency_id,
+            score=score,
+            max_score=10.0,
+            feedback=(
+                "Strong answer; increase depth and specificity in the next question."
+                if score >= 7.0
+                else "The next question should adapt to the candidate's current level of detail."
+            ),
+            strengths=strengths,
+            weaknesses=weaknesses,
+            follow_up_needed=score < 6.0,
+        )
+
+    def _next_difficulty(self, current: DifficultyLevel, evaluation: AnswerEvaluation) -> DifficultyLevel:
+        if evaluation.score >= 7.5:
+            return self._difficulty_step(current, 1)
+        if evaluation.score <= 4.0:
+            return self._difficulty_step(current, -1)
+        return current
+
+    def _topic_from_retrieval_result(
+        self,
+        curriculum_topics: list,
+        result,
+    ):
+        for topic in curriculum_topics:
+            if topic.day == result.day and self._topic_name(topic) == result.title:
+                return topic
+        for topic in curriculum_topics:
+            if topic.day == result.day:
+                return topic
+        for topic in curriculum_topics:
+            if self._topic_name(topic).casefold() == result.title.casefold():
+                return topic
+        return None
+
+    def _select_next_topic(
+        self,
+        candidate,
+        session: InterviewSession,
+        evaluation: AnswerEvaluation,
+        current_plan: QuestionPlan,
+        curriculum_repo: CurriculumRepository,
+        retriever: LocalCurriculumRetriever,
+    ):
+        curriculum_topics = curriculum_repo.list_all()
+        if not curriculum_topics:
+            raise ValueError("No curriculum topics available")
+
+        current_topic = curriculum_repo.get_by_id(current_plan.competency_id)
+        current_day = current_topic.day if current_topic is not None else None
+        asked_topic_ids = set(session.metadata.get("asked_topic_ids", []))
+        asked_topic_ids.add(current_plan.competency_id)
+
+        skipped_topics = {topic_id for topic_id in candidate.skipped_topics if topic_id}
+        completed_topics = [topic_id for topic_id in candidate.completed_topics if topic_id]
+        weak_topics = [topic_id for topic_id in candidate.weak_topics if topic_id]
+
+        def to_topic(topic_id: str):
+            topic = curriculum_repo.get_by_id(topic_id)
+            if topic is None:
+                return None
+            if topic.topic_id in asked_topic_ids or topic.topic_id in skipped_topics:
+                return None
+            return topic
+
+        ranked_topics: list = []
+        seen: set[str] = set()
+
+        def add_topic(topic) -> None:
+            if topic is None:
+                return
+            if topic.topic_id in seen:
+                return
+            if topic.topic_id in asked_topic_ids:
+                return
+            seen.add(topic.topic_id)
+            ranked_topics.append(topic)
+
+        if evaluation.score <= 4.0:
+            for topic_id in weak_topics:
+                add_topic(to_topic(topic_id))
+        elif evaluation.score >= 7.5:
+            for topic_id in completed_topics:
+                add_topic(to_topic(topic_id))
+
+        query_seed = " ".join(
+            part for part in [current_plan.topic_context, current_plan.objective, evaluation.feedback] if part
+        )
+        if query_seed.strip():
+            for result in retriever.search(query_seed, limit=8):
+                add_topic(self._topic_from_retrieval_result(curriculum_topics, result))
+
+        ordered_topics = sorted(curriculum_topics, key=lambda topic: (topic.day or 0, topic.topic_id))
+        if current_day is not None:
+            start_index = next(
+                (index for index, topic in enumerate(ordered_topics) if topic.topic_id == current_plan.competency_id),
+                0,
+            )
+            for offset in range(1, len(ordered_topics) + 1):
+                add_topic(ordered_topics[(start_index + offset) % len(ordered_topics)])
+        else:
+            for topic in ordered_topics:
+                add_topic(topic)
+
+        if not ranked_topics:
+            ranked_topics = [topic for topic in ordered_topics if topic.topic_id != current_plan.competency_id] or ordered_topics
+
+        preferred_topic_ids = set()
+        if evaluation.score <= 4.0:
+            preferred_topic_ids.update(weak_topics)
+        elif evaluation.score >= 7.5:
+            preferred_topic_ids.update(completed_topics)
+
+        def rank_topic(topic) -> tuple[int, int, int]:
+            score = 0
+            if topic.topic_id in preferred_topic_ids:
+                score += 100
+            if topic.topic_id in completed_topics and evaluation.score >= 7.5:
+                score += 20
+            if topic.topic_id in weak_topics and evaluation.score <= 4.0:
+                score += 20
+            if topic.topic_id in skipped_topics:
+                score -= 25
+            if current_day is not None and topic.day is not None:
+                if evaluation.score >= 7.5:
+                    score += max(0, topic.day - current_day)
+                elif evaluation.score <= 4.0:
+                    score += max(0, current_day - topic.day)
+                else:
+                    score -= abs(topic.day - current_day)
+            return (score, topic.day or 0, -ordered_topics.index(topic))
+
+        ranked_topics.sort(key=rank_topic, reverse=True)
+        return ranked_topics[0]
+
+    def _build_question_plan(
+        self,
+        candidate,
+        session: InterviewSession,
+        evaluation: AnswerEvaluation,
+        current_plan: QuestionPlan,
+        curriculum_repo: CurriculumRepository,
+        retriever: LocalCurriculumRetriever,
+        next_difficulty: DifficultyLevel,
+    ) -> tuple[str, str, DifficultyLevel, QuestionPlan, AdaptiveDecision]:
+        next_topic = self._select_next_topic(candidate, session, evaluation, current_plan, curriculum_repo, retriever)
+        topic_name = self._topic_name(next_topic)
+
+        question_type = QuestionType.CONCEPTUAL
+        if next_topic.type and "coding" in next_topic.type.lower():
+            question_type = QuestionType.CODING
+        elif next_topic.tools and any(tool.lower() in {"docker", "kubernetes"} for tool in next_topic.tools):
+            question_type = QuestionType.SYSTEM_DESIGN
+
+        retrieval_results = retriever.search(topic_name, limit=1)
+        topic_context = retrieval_results[0].title if retrieval_results else topic_name
+        objectives = retrieval_results[0].objectives if retrieval_results else list(next_topic.objectives)
+
+        plan = QuestionPlan(
+            plan_id=f"qp-{uuid.uuid4().hex[:8]}",
+            competency_id=next_topic.topic_id,
+            target_difficulty=next_difficulty,
+            question_type=question_type,
+            topic_context=topic_context,
+            follow_up_to=current_plan.plan_id,
+            objective=f"Assess the candidate's understanding of {topic_name} after their last answer",
+            expected_criteria=[
+                f"Explain the core idea behind {topic_name}",
+                *[objective for objective in objectives[:2]],
+            ],
+            selection_reasoning=f"Selected {topic_name} after evaluating the previous answer at score {evaluation.score:.1f}.",
+        )
+
+        question_text = self._build_question_text(
+            topic_name=topic_name,
+            difficulty=next_difficulty,
+            question_type=question_type,
+            evaluation=evaluation,
+            previous_question=session.current_question,
+        )
+        plan.generated_question_text = question_text
+
+        difficulty_order = [
+            DifficultyLevel.FOUNDATIONAL,
+            DifficultyLevel.INTERMEDIATE,
+            DifficultyLevel.ADVANCED,
+            DifficultyLevel.EXPERT,
+        ]
+        if difficulty_order.index(next_difficulty) > difficulty_order.index(current_plan.target_difficulty):
+            action = AdaptiveAction.INCREASE_DIFFICULTY
+        elif difficulty_order.index(next_difficulty) < difficulty_order.index(current_plan.target_difficulty):
+            action = AdaptiveAction.DECREASE_DIFFICULTY
+        elif next_topic.topic_id == current_plan.competency_id:
+            action = AdaptiveAction.CONTINUE_SAME_TOPIC
+        else:
+            action = AdaptiveAction.SWITCH_TOPIC
+
+        decision = AdaptiveDecision(
+            decision_id=f"dec-{uuid.uuid4().hex[:8]}",
+            evaluation_id=evaluation.evaluation_id,
+            action=action,
+            next_competency_id=next_topic.topic_id,
+            next_difficulty=next_difficulty,
+            reasoning=plan.selection_reasoning,
+        )
+
+        return question_text, topic_name, next_difficulty, plan, decision
+
+    def _build_question_text(
+        self,
+        topic_name: str,
+        difficulty: DifficultyLevel,
+        question_type: QuestionType,
+        evaluation: AnswerEvaluation,
+        previous_question: str | None,
+    ) -> str:
+        if question_type == QuestionType.CODING:
+            question = (
+                f"For {topic_name} at {difficulty.value} difficulty, how would you implement this in practice and explain the key trade-offs?"
+            )
+        elif question_type == QuestionType.SYSTEM_DESIGN:
+            question = (
+                f"For {topic_name} at {difficulty.value} difficulty, outline the architecture choices, failure modes, and trade-offs you would consider."
+            )
+        elif evaluation.score < 4.0:
+            question = (
+                f"For {topic_name} at {difficulty.value} difficulty, walk me through the core concept more carefully and correct the gap from your last answer."
+            )
+        elif evaluation.score >= 7.5:
+            question = (
+                f"For {topic_name} at {difficulty.value} difficulty, go one level deeper and explain how you would apply this in a realistic scenario."
+            )
+        else:
+            question = (
+                f"For {topic_name} at {difficulty.value} difficulty, explain the main idea in your own words and give one concrete example."
+            )
+
+        if previous_question and question == previous_question:
+            question = f"{question} Use a different angle from the previous question."
+        return question
+
+    def _build_first_question(self, candidate) -> tuple[str, str, DifficultyLevel, QuestionPlan]:
+        curriculum_repo = CurriculumRepository()
+        curriculum_topics = curriculum_repo.list_all()
+        retriever = LocalCurriculumRetriever(repository=curriculum_repo)
+
+        completed_topics = [topic_id for topic_id in candidate.completed_topics if topic_id]
+        selected_topic = None
+        if completed_topics:
+            for topic_id in completed_topics:
+                topic = curriculum_repo.get_by_id(topic_id)
+                if topic is not None:
+                    selected_topic = topic
+                    break
+
+        if selected_topic is None:
+            selected_topic = next((topic for topic in curriculum_topics if topic.day is not None), None)
+
+        if selected_topic is None:
+            raise ValueError(f"No curriculum topics available for candidate {candidate.candidate_id}")
+
+        completion_rate = 0.0
+        if curriculum_topics:
+            completion_rate = min(1.0, len(completed_topics) / len(curriculum_topics))
+
+        if completed_topics and completion_rate >= 0.6:
+            suggested_difficulty = DifficultyLevel.INTERMEDIATE
+        elif candidate.weak_topics:
+            suggested_difficulty = DifficultyLevel.FOUNDATIONAL
+        else:
+            suggested_difficulty = DifficultyLevel.FOUNDATIONAL
+
+        retrieval_results = retriever.search(selected_topic.title or selected_topic.topic_id, limit=1)
+        retrieval_context = retrieval_results[0] if retrieval_results else None
+        topic_context = retrieval_context.title if retrieval_context else selected_topic.title or selected_topic.topic_id
+        objectives = retrieval_context.objectives if retrieval_context else list(selected_topic.objectives)
+
+        target_difficulty = suggested_difficulty
+        question_type = QuestionType.CONCEPTUAL
+        if selected_topic.type and "coding" in selected_topic.type.lower():
+            question_type = QuestionType.CODING
+        elif selected_topic.tools and any(tool in {"docker", "kubernetes"} for tool in selected_topic.tools):
+            question_type = QuestionType.SYSTEM_DESIGN
+
+        plan = QuestionPlan(
+            plan_id=f"qp-{uuid.uuid4().hex[:8]}",
+            competency_id=selected_topic.topic_id,
+            target_difficulty=target_difficulty,
+            question_type=question_type,
+            topic_context=topic_context,
+            objective=f"Assess the candidate's understanding of {selected_topic.title or selected_topic.topic_id}",
+            expected_criteria=[
+                f"Explain the core idea behind {selected_topic.title or selected_topic.topic_id}",
+                *[objective for objective in objectives[:2]],
+            ],
+            selection_reasoning=(
+                f"Selected {selected_topic.title or selected_topic.topic_id} from the candidate's completed curriculum "
+                f"and started at {target_difficulty.value} difficulty."
+            ),
+        )
+
+        question_text = (
+            f"For {selected_topic.title or selected_topic.topic_id}, explain the main concept in your own words "
+            f"and describe one practical example or trade-off you would consider."
+        )
+        plan.generated_question_text = question_text
+        return question_text, selected_topic.title or selected_topic.topic_id, target_difficulty, plan
+
     # ── Public API ───────────────────────────────────────────────────
 
     def create_session(self, request: InterviewSessionCreate) -> InterviewSession:
@@ -77,7 +490,8 @@ class InterviewService:
             updated_at=datetime.utcnow(),
         )
 
-        # TODO: Generate the first adaptive question based on candidate profile
+        question_text, current_topic, difficulty, question_plan = self._build_first_question(candidate)
+
         welcome = InterviewMessage(
             role="interviewer",
             content=(
@@ -86,7 +500,28 @@ class InterviewService:
             ),
         )
         session.messages.append(welcome)
+        session.messages.append(
+            InterviewMessage(role="interviewer", content=question_text, metadata={"question_plan_id": question_plan.plan_id})
+        )
+        session.current_question = question_text
+        session.question = question_text
+        session.current_topic = current_topic
+        session.difficulty = difficulty
+        session.question_number = 1
         session.questions_asked = 1
+        intelligence = self._build_candidate_intelligence(
+            candidate=candidate,
+            selected_topic_id=question_plan.competency_id,
+            suggested_difficulty=difficulty,
+        )
+        session.metadata.update(
+            {
+                "active_question_plan": question_plan.model_dump(mode="json"),
+                "active_question_plan_id": question_plan.plan_id,
+                "candidate_intelligence": intelligence.model_dump(mode="json"),
+                "asked_topic_ids": [question_plan.competency_id],
+            }
+        )
 
         self._save_session(session)
         logger.info(
@@ -123,24 +558,57 @@ class InterviewService:
         if session.status != InterviewStatus.IN_PROGRESS:
             raise SessionExpiredError(session_id)
 
+        curriculum_repo = CurriculumRepository()
+        retriever = LocalCurriculumRetriever(repository=curriculum_repo)
+        candidate = self._candidates.get_by_id(session.candidate_id)
+
+        current_plan_data = session.metadata.get("active_question_plan")
+        if not isinstance(current_plan_data, dict):
+            raise ValueError("Session is missing the active question plan")
+        current_plan = QuestionPlan.model_validate(current_plan_data)
+
         # Record the candidate's answer
         session.messages.append(
             InterviewMessage(role="candidate", content=answer.answer)
         )
 
-        # ------------------------------------------------------------------
-        # TODO: Implement adaptive logic here
-        # 1. Evaluate the answer using the AI engine
-        # 2. Determine the next topic based on candidate's mission history
-        # 3. Adjust difficulty level based on answer quality
-        # 4. Generate the next question via the AI engine
-        # ------------------------------------------------------------------
-        next_question = InterviewMessage(
-            role="interviewer",
-            content="[TODO] Next adaptive question will be generated here.",
+        evaluation = self._evaluate_answer(
+            answer_text=answer.answer,
+            question_plan=current_plan,
+            topic_name=session.current_topic or current_plan.topic_context or current_plan.competency_id,
         )
-        session.messages.append(next_question)
+        next_difficulty = self._next_difficulty(session.difficulty, evaluation)
+
+        question_text, current_topic, difficulty, question_plan, decision = self._build_question_plan(
+            candidate=candidate,
+            session=session,
+            evaluation=evaluation,
+            current_plan=current_plan,
+            curriculum_repo=curriculum_repo,
+            retriever=retriever,
+            next_difficulty=next_difficulty,
+        )
+
+        session.messages.append(
+            InterviewMessage(role="interviewer", content=question_text, metadata={"question_plan_id": question_plan.plan_id})
+        )
+        session.question_number += 1
         session.questions_asked += 1
+        session.current_question = question_text
+        session.question = question_text
+        session.current_topic = current_topic
+        session.difficulty = difficulty
+        asked_topic_ids = list(session.metadata.get("asked_topic_ids", []))
+        asked_topic_ids.append(question_plan.competency_id)
+        session.metadata.update(
+            {
+                "active_question_plan": question_plan.model_dump(mode="json"),
+                "active_question_plan_id": question_plan.plan_id,
+                "last_evaluation": evaluation.model_dump(mode="json"),
+                "last_adaptive_decision": decision.model_dump(mode="json"),
+                "asked_topic_ids": asked_topic_ids,
+            }
+        )
         session.updated_at = datetime.utcnow()
 
         self._save_session(session)

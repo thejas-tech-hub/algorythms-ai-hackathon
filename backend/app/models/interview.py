@@ -58,6 +58,9 @@ class InterviewSession(BaseSchema):
     messages: list[InterviewMessage] = Field(default_factory=list)
     current_topic: str | None = None
     difficulty: DifficultyLevel = DifficultyLevel.FOUNDATIONAL
+    current_question: str | None = None
+    question: str | None = None
+    question_number: int = 1
     questions_asked: int = 0
     metadata: dict = Field(default_factory=dict)
 

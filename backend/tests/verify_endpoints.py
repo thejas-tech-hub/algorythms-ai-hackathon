@@ -56,23 +56,63 @@ check("GET /candidates/CAND-001", "GET", "/api/v1/candidates/CAND-001", expect_s
 result = check("POST /interviews", "POST", "/api/v1/interviews",
                body={"candidate_id": "CAND-001"}, expect_status=201)
 session_id = result.get("session_id") if result else None
+question_1 = result.get("current_question") if result else None
 if session_id:
     print(f"         session_id: {session_id}")
+if question_1:
+    print(f"         question_1: {question_1}")
+
+# 5b. Verify session state after creation
+if session_id:
+    result = check("GET /interviews/{id}", "GET", f"/api/v1/interviews/{session_id}", expect_status=200)
+    if result:
+        print(f"         persisted_question_1: {result.get('current_question')}")
 
 # 6. Submit answer
 if session_id:
-    check("POST /interviews/{id}/respond", "POST",
-          f"/api/v1/interviews/{session_id}/respond",
-          body={"answer": "My test answer to the question"},
-          expect_status=200)
+    result = check("POST /interviews/{id}/respond", "POST",
+                  f"/api/v1/interviews/{session_id}/respond",
+                  body={"answer": "My test answer to the question"},
+                  expect_status=200)
+    question_2 = result.get("current_question") if result else None
+    if question_2:
+        print(f"         question_2: {question_2}")
+    if question_1 and question_2 and question_1 == question_2:
+        print("  FAIL  Question 2 matched Question 1")
+        sys.exit(1)
 
-# 7. End interview
+# 6b. Verify session state after first answer
+if session_id:
+    result = check("GET /interviews/{id} after answer", "GET", f"/api/v1/interviews/{session_id}", expect_status=200)
+    if result:
+        print(f"         persisted_question_2: {result.get('current_question')}")
+
+# 7. Submit second answer
+if session_id:
+    result = check("POST /interviews/{id}/respond (2)", "POST",
+                  f"/api/v1/interviews/{session_id}/respond",
+                  body={"answer": "My second answer should lead to a different topic and a deeper follow-up."},
+                  expect_status=200)
+    question_3 = result.get("current_question") if result else None
+    if question_3:
+        print(f"         question_3: {question_3}")
+    if question_2 and question_3 and question_2 == question_3:
+        print("  FAIL  Question 3 matched Question 2")
+        sys.exit(1)
+
+# 7b. Verify session state after second answer
+if session_id:
+    result = check("GET /interviews/{id} after second answer", "GET", f"/api/v1/interviews/{session_id}", expect_status=200)
+    if result:
+        print(f"         persisted_question_3: {result.get('current_question')}")
+
+# 8. End interview
 if session_id:
     check("POST /interviews/{id}/end", "POST",
           f"/api/v1/interviews/{session_id}/end",
           expect_status=200)
 
-# 8. Swagger docs
+# 9. Swagger docs
 try:
     resp = urllib.request.urlopen(BASE + "/docs")
     swagger_ok = resp.status == 200
