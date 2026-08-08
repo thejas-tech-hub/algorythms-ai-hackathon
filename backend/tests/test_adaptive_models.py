@@ -401,6 +401,15 @@ class TestAnswerEvaluation:
         assert ae.weaknesses == []
         assert ae.follow_up_needed is False
         assert isinstance(ae.evaluated_at, datetime)
+        assert ae.overall_score == 75.0
+        assert ae.conceptual_correctness_score == 0.0
+        assert ae.depth_reasoning_score == 0.0
+        assert ae.practical_understanding_score == 0.0
+        assert ae.confidence_score == 0.0
+        assert ae.evidence_score == 0.0
+        assert ae.missing_concepts == []
+        assert ae.misconceptions == []
+        assert ae.rationale == ""
 
     def test_full_construction_with_evidence(self):
         evidence = [
@@ -423,13 +432,35 @@ class TestAnswerEvaluation:
             competency_id="python-async",
             score=6.0,
             max_score=10.0,
+            question_text="Explain async generators",
+            overall_score=60.0,
+            conceptual_correctness_score=70.0,
+            depth_reasoning_score=55.0,
+            practical_understanding_score=45.0,
+            confidence_score=80.0,
+            evidence_score=75.0,
             evidence=evidence,
             feedback="Good understanding of basics but needs work on advanced patterns",
+            strengths=["Used relevant terminology"],
+            weaknesses=["Needs more detail"],
+            missing_concepts=["Error propagation"],
+            misconceptions=["Confuses generators with coroutines"],
+            rationale="Captured the core idea but missed advanced nuance",
             follow_up_needed=True,
         )
         assert len(ae.evidence) == 2
         assert ae.evidence[0].demonstrated is True
         assert ae.follow_up_needed is True
+        assert ae.question_text == "Explain async generators"
+        assert ae.overall_score == 60.0
+        assert ae.conceptual_correctness_score == 70.0
+        assert ae.depth_reasoning_score == 55.0
+        assert ae.practical_understanding_score == 45.0
+        assert ae.confidence_score == 80.0
+        assert ae.evidence_score == 75.0
+        assert ae.missing_concepts == ["Error propagation"]
+        assert ae.misconceptions == ["Confuses generators with coroutines"]
+        assert "Captured the core idea" in ae.rationale
 
     def test_score_boundaries(self):
         ae = AnswerEvaluation(evaluation_id="x", plan_id="x", competency_id="x", score=0.0)

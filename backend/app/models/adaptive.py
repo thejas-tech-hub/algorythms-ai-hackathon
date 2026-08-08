@@ -337,11 +337,51 @@ class AnswerEvaluation(BaseSchema):
         ...,
         description="Competency this evaluation applies to (denormalized from QuestionPlan)",
     )
+    question_text: str = Field(
+        default="",
+        description="Text of the question that was evaluated",
+    )
     score: float = Field(
         ...,
         ge=0.0,
         le=10.0,
-        description="Numeric score (0.0–10.0)",
+        description="Legacy normalized score (0.0–10.0)",
+    )
+    overall_score: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=100.0,
+        description="Overall score on a 0–100 scale",
+    )
+    conceptual_correctness_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=100.0,
+        description="How well the answer reflects the core concept",
+    )
+    depth_reasoning_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=100.0,
+        description="How much reasoning, trade-off analysis, or nuance the answer shows",
+    )
+    practical_understanding_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=100.0,
+        description="How well the answer connects the concept to practice",
+    )
+    confidence_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=100.0,
+        description="Evaluator confidence in the assessment",
+    )
+    evidence_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=100.0,
+        description="Evidence strength derived from the answer",
     )
     max_score: float = Field(
         default=10.0,
@@ -365,6 +405,18 @@ class AnswerEvaluation(BaseSchema):
         default_factory=list,
         description="Specific weaknesses or gaps in the candidate's answer",
     )
+    missing_concepts: list[str] = Field(
+        default_factory=list,
+        description="Core concepts not yet demonstrated in the answer",
+    )
+    misconceptions: list[str] = Field(
+        default_factory=list,
+        description="Incorrect or misleading ideas detected in the answer",
+    )
+    rationale: str = Field(
+        default="",
+        description="Concise evaluator rationale",
+    )
     follow_up_needed: bool = Field(
         default=False,
         description="Whether the evaluator recommends a follow-up question",
@@ -377,6 +429,8 @@ class AnswerEvaluation(BaseSchema):
     @model_validator(mode="after")
     def score_within_max(self) -> "AnswerEvaluation":
         """Ensure score does not exceed max_score."""
+        if self.overall_score is None:
+            self.overall_score = round(self.score * 10.0, 2)
         if self.score > self.max_score:
             raise ValueError(
                 f"score ({self.score}) cannot exceed max_score ({self.max_score})"

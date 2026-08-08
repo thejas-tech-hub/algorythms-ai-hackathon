@@ -22,8 +22,10 @@ from app.models.adaptive import (
     AdaptiveDecision,
     AnswerEvaluation,
     CandidateIntelligenceProfile,
+    EvidenceStrength,
     QuestionPlan,
     QuestionType,
+    RubricEvidence,
 )
 from app.models.common import DifficultyLevel, InterviewStatus
 from app.models.interview import (
@@ -123,8 +125,9 @@ class InterviewService:
         topic_name: str,
     ) -> AnswerEvaluation:
         normalized_answer = answer_text.strip()
+        lowered = normalized_answer.casefold()
         answer_tokens = _tokenize(normalized_answer)
-        context_tokens = _tokenize(
+        plan_tokens = _tokenize(
             " ".join(
                 [
                     question_plan.objective,
@@ -135,43 +138,142 @@ class InterviewService:
             )
         )
 
-        overlap = len(answer_tokens & context_tokens)
-        word_count = len(answer_tokens)
-        score = min(10.0, round((word_count / 8.0) + (overlap * 1.4), 2))
-
-        lowered = normalized_answer.casefold()
-        if any(marker in lowered for marker in ("example", "because", "trade-off", "tradeoff", "edge case")):
-            score = min(10.0, score + 0.6)
-        if any(marker in lowered for marker in ("implement", "architecture", "complexity", "latency", "workflow")):
-            score = min(10.0, score + 0.4)
-
+        criterion_hits: list[str] = []
+        missing_concepts: list[str] = []
         strengths: list[str] = []
         weaknesses: list[str] = []
-        if overlap:
-            strengths.append(f"Referenced {overlap} relevant concept(s) from the current topic")
-        if word_count >= 18:
+        misconceptions: list[str] = []
+        evidence: list[RubricEvidence] = []
+
+        practical_markers = ("example", "for instance", "in practice", "trade-off", "tradeoff", "use case")
+        reasoning_markers = ("because", "therefore", "so that", "if", "when", "compared", "trade-off", "tradeoff")
+        uncertainty_markers = ("maybe", "might", "not sure", "i think", "probably", "guess")
+
+        for criterion in question_plan.expected_criteria:
+            criterion_tokens = _tokenize(criterion)
+            if criterion_tokens and criterion_tokens.intersection(answer_tokens):
+                criterion_hits.append(criterion)
+                evidence.append(
+                    RubricEvidence(
+                        competency_id=question_plan.competency_id,
+                        criterion=criterion,
+                        demonstrated=True,
+                        strength=EvidenceStrength.STRONG if len(criterion_tokens.intersection(answer_tokens)) >= 2 else EvidenceStrength.MODERATE,
+                        notes=f"Matched tokens: {sorted(criterion_tokens.intersection(answer_tokens))[:4]}",
+                    )
+                )
+            else:
+                missing_concepts.append(criterion)
+                evidence.append(
+                    RubricEvidence(
+                        competency_id=question_plan.competency_id,
+                        criterion=criterion,
+                        demonstrated=False,
+                        strength=EvidenceStrength.WEAK,
+                        notes="No clear reference detected in the answer",
+                    )
+                )
+
+        concept_overlap = len(answer_tokens & plan_tokens)
+        concept_coverage = 0.0
+        if plan_tokens:
+            concept_coverage = min(1.0, concept_overlap / max(1, len(plan_tokens)))
+
+        word_count = len(answer_tokens)
+        length_score = min(100.0, word_count * 2.5)
+        coverage_score = min(100.0, concept_coverage * 100.0)
+        reasoning_score = min(
+            100.0,
+            (20.0 if any(marker in lowered for marker in reasoning_markers) else 0.0)
+            + (25.0 if any(marker in lowered for marker in practical_markers) else 0.0)
+            + min(55.0, len([token for token in ("because", "therefore", "trade-off", "tradeoff", "compared", "however") if token in lowered]) * 18.0),
+        )
+        practical_score = min(
+            100.0,
+            (35.0 if any(marker in lowered for marker in practical_markers) else 0.0)
+            + (35.0 if any(token in lowered for token in ("implementation", "system", "workflow", "latency", "quality", "retrieval", "architecture")) else 0.0)
+            + min(30.0, word_count),
+        )
+
+        if any(marker in lowered for marker in uncertainty_markers) and word_count < 12:
+            weaknesses.append("The answer sounds uncertain or underdeveloped")
+        if any(marker in lowered for marker in ("always", "never", "guaranteed")) and not any(
+            marker in lowered for marker in ("usually", "depends", "trade-off", "tradeoff")
+        ):
+            misconceptions.append("Overly absolute language without acknowledging trade-offs")
+        if word_count < 8:
+            weaknesses.append("Answer is very short and lacks enough detail")
+        elif word_count >= 18:
             strengths.append("Provided enough detail to support a deeper follow-up")
+        if concept_coverage >= 0.35:
+            strengths.append("Referenced the question context and expected criteria")
         else:
-            weaknesses.append("Answer is short and could include more technical detail")
-        if score >= 7.0:
-            strengths.append("Demonstrated solid understanding of the topic")
+            weaknesses.append("Did not address enough of the expected criteria")
+        if reasoning_score >= 50.0:
+            strengths.append("Included explicit reasoning or trade-off discussion")
         else:
-            weaknesses.append("The answer did not yet demonstrate the core concept clearly")
+            missing_concepts.append("Reasoning or trade-off discussion")
+        if practical_score >= 50.0:
+            strengths.append("Connected the topic to practice or implementation")
+        else:
+            missing_concepts.append("Practical application or implementation detail")
+
+        confidence_score = min(
+            100.0,
+            40.0
+            + (15.0 if criterion_hits else 0.0)
+            + (20.0 if word_count >= 18 else 0.0)
+            + (15.0 if not misconceptions else -10.0)
+            + (10.0 if concept_overlap else 0.0),
+        )
+        evidence_score = min(100.0, len([item for item in evidence if item.demonstrated]) * 20.0 + concept_coverage * 40.0)
+        overall_score = round(
+            min(
+                100.0,
+                (coverage_score * 0.35)
+                + (reasoning_score * 0.25)
+                + (practical_score * 0.2)
+                + (length_score * 0.1)
+                + (confidence_score * 0.1),
+            ),
+            2,
+        )
+
+        normalized_score = round(overall_score / 10.0, 2)
+        rationale_parts = [
+            f"Matched {len(criterion_hits)} of {len(question_plan.expected_criteria)} expected criteria",
+            f"Answer length: {word_count} tokens",
+        ]
+        if strengths:
+            rationale_parts.append(f"Strengths: {', '.join(strengths[:3])}")
+        if weaknesses:
+            rationale_parts.append(f"Weaknesses: {', '.join(weaknesses[:3])}")
 
         return AnswerEvaluation(
             evaluation_id=f"eval-{uuid.uuid4().hex[:8]}",
             plan_id=question_plan.plan_id,
             competency_id=question_plan.competency_id,
-            score=score,
+            question_text=question_plan.generated_question_text or question_plan.objective,
+            score=normalized_score,
+            overall_score=overall_score,
+            conceptual_correctness_score=coverage_score,
+            depth_reasoning_score=reasoning_score,
+            practical_understanding_score=practical_score,
+            confidence_score=confidence_score,
+            evidence_score=evidence_score,
             max_score=10.0,
+            evidence=evidence,
             feedback=(
-                "Strong answer; increase depth and specificity in the next question."
-                if score >= 7.0
-                else "The next question should adapt to the candidate's current level of detail."
+                "Strong conceptual alignment with clear reasoning and practical detail."
+                if overall_score >= 70.0
+                else "Some relevant signals were present, but the answer needs more completeness and detail."
             ),
             strengths=strengths,
             weaknesses=weaknesses,
-            follow_up_needed=score < 6.0,
+            missing_concepts=missing_concepts,
+            misconceptions=misconceptions,
+            rationale="; ".join(rationale_parts),
+            follow_up_needed=overall_score < 60.0 or bool(missing_concepts),
         )
 
     def _next_difficulty(self, current: DifficultyLevel, evaluation: AnswerEvaluation) -> DifficultyLevel:
@@ -600,10 +702,16 @@ class InterviewService:
         session.difficulty = difficulty
         asked_topic_ids = list(session.metadata.get("asked_topic_ids", []))
         asked_topic_ids.append(question_plan.competency_id)
+        evaluation_history = session.metadata.get("evaluation_history")
+        if not isinstance(evaluation_history, list):
+            evaluation_history = []
+        evaluation_history.append(evaluation.model_dump(mode="json"))
         session.metadata.update(
             {
                 "active_question_plan": question_plan.model_dump(mode="json"),
                 "active_question_plan_id": question_plan.plan_id,
+                "last_answer_evaluation": evaluation.model_dump(mode="json"),
+                "evaluation_history": evaluation_history,
                 "last_evaluation": evaluation.model_dump(mode="json"),
                 "last_adaptive_decision": decision.model_dump(mode="json"),
                 "asked_topic_ids": asked_topic_ids,
