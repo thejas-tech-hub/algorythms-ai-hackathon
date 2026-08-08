@@ -2,16 +2,16 @@
 Health and readiness probe endpoints.
 Owner: THEJAS
 
-GET /api/v1/health  — liveness (always OK if server is up)
-GET /api/v1/ready   — readiness (confirms data is loaded)
+GET /api/v1/health  -- liveness (always OK if server is up)
+GET /api/v1/ready   -- readiness (confirms data is loaded)
 """
 
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
-from app.api.deps import get_candidate_loader
-from app.data.candidate_loader import JSONCandidateLoader
+from app.api.deps import get_candidate_repo
+from app.data.repositories import CandidateRepository
 
 router = APIRouter(tags=["Health"])
 
@@ -32,13 +32,11 @@ async def health_check() -> dict:
     description="Returns readiness status and loaded candidate count.",
 )
 async def readiness_check(
-    loader: JSONCandidateLoader = Depends(get_candidate_loader),
+    repo: CandidateRepository = Depends(get_candidate_repo),
 ) -> dict:
     """Readiness probe — confirms candidate data is loaded."""
-    candidates_loaded = loader.is_loaded
-    candidate_count = len(loader.get_all()) if candidates_loaded else 0
-
+    candidates = repo.list_all()
     return {
-        "ready": candidates_loaded,
-        "candidates_loaded": candidate_count,
+        "ready": True,
+        "candidates_loaded": len(candidates),
     }

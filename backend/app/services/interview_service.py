@@ -2,7 +2,7 @@
 Interview session orchestration.
 Owner: THEJAS
 
-Manages the full interview session lifecycle: create → ask → respond → end.
+Manages the full interview session lifecycle: create -> ask -> respond -> end.
 All adaptive logic (question selection, evaluation, scoring) is stubbed
 with TODO markers for future implementation.
 """
@@ -12,7 +12,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from app.data.session_store import InMemorySessionStore
+from app.data.session_store import SessionStore
 from app.models.interview import (
     InterviewSession,
     InterviewSessionCreate,
@@ -38,11 +38,26 @@ class InterviewService:
 
     def __init__(
         self,
-        session_store: InMemorySessionStore,
+        session_store: SessionStore,
         candidate_service: CandidateService,
     ) -> None:
         self._sessions = session_store
         self._candidates = candidate_service
+
+    # ── Persistence helpers ──────────────────────────────────────────
+    # SessionStore is a generic dict store; we serialise/deserialise
+    # InterviewSession through Pydantic so the data layer stays generic.
+
+    def _save_session(self, session: InterviewSession) -> None:
+        self._sessions.set(session.session_id, session.model_dump(mode="json"))
+
+    def _load_session(self, session_id: str) -> InterviewSession | None:
+        data = self._sessions.get(session_id)
+        if data is None:
+            return None
+        return InterviewSession.model_validate(data)
+
+    # ── Public API ───────────────────────────────────────────────────
 
     def create_session(self, request: InterviewSessionCreate) -> InterviewSession:
         """
@@ -56,7 +71,7 @@ class InterviewService:
 
         session = InterviewSession(
             session_id=str(uuid.uuid4()),
-            candidate_id=candidate.member.id,
+            candidate_id=candidate.candidate_id,
             status=InterviewStatus.IN_PROGRESS,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow(),
@@ -66,20 +81,18 @@ class InterviewService:
         welcome = InterviewMessage(
             role="interviewer",
             content=(
-                f"Interview session started for {candidate.member.name}. "
-                f"Role: {candidate.member.job_role}. "
+                f"Interview session started for candidate {candidate.candidate_id}. "
                 f"Welcome! The adaptive interview will begin shortly."
             ),
         )
         session.messages.append(welcome)
         session.questions_asked = 1
 
-        self._sessions.save(session)
+        self._save_session(session)
         logger.info(
-            "Created session %s for candidate %s (%s)",
+            "Created session %s for candidate %s",
             session.session_id,
             session.candidate_id,
-            candidate.member.name,
         )
         return session
 
@@ -90,7 +103,7 @@ class InterviewService:
         Raises:
             SessionNotFoundError: If the session does not exist.
         """
-        session = self._sessions.get(session_id)
+        session = self._load_session(session_id)
         if session is None:
             raise SessionNotFoundError(session_id)
         return session
@@ -130,7 +143,7 @@ class InterviewService:
         session.questions_asked += 1
         session.updated_at = datetime.utcnow()
 
-        self._sessions.save(session)
+        self._save_session(session)
         logger.info(
             "Session %s: answer recorded, question #%d generated",
             session_id,
@@ -153,7 +166,7 @@ class InterviewService:
 
         session.status = InterviewStatus.COMPLETED
         session.updated_at = datetime.utcnow()
-        self._sessions.save(session)
+        self._save_session(session)
 
         duration = (session.updated_at - session.created_at).total_seconds()
 

@@ -8,8 +8,8 @@ No HTTP concerns, no direct file I/O — depends on a repository abstraction.
 
 from __future__ import annotations
 
-from app.data.candidate_loader import JSONCandidateLoader
-from app.models.candidate import CandidateDetail
+from app.data.repositories import CandidateRepository
+from app.data.candidate_loader import Candidate
 from app.core.exceptions import CandidateNotFoundError
 from app.core.logging import get_logger
 
@@ -19,16 +19,16 @@ logger = get_logger(__name__)
 class CandidateService:
     """Handles candidate lookup and derived analytics."""
 
-    def __init__(self, repository: JSONCandidateLoader) -> None:
+    def __init__(self, repository: CandidateRepository) -> None:
         self._repo = repository
 
-    def list_all(self) -> list[CandidateDetail]:
+    def list_all(self) -> list[Candidate]:
         """Return all candidates in the dataset."""
-        candidates = self._repo.get_all()
+        candidates = self._repo.list_all()
         logger.debug("Listing %d candidates", len(candidates))
         return candidates
 
-    def get_by_id(self, candidate_id: str) -> CandidateDetail:
+    def get_by_id(self, candidate_id: str) -> Candidate:
         """
         Return a single candidate by ID.
 

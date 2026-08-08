@@ -26,7 +26,7 @@ from app.core.exceptions import (
 )
 from app.core.logging import setup_logging, get_logger
 from app.core.middleware import register_middleware
-from app.api.deps import get_candidate_loader
+from app.api.deps import get_candidate_repo
 
 
 logger = get_logger(__name__)
@@ -39,10 +39,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Starting AI Interview Agent")
 
     # Pre-load candidate data at startup
-    loader = get_candidate_loader()
+    repo = get_candidate_repo()
     logger.info(
         "Candidate data ready: %d candidates loaded",
-        len(loader.get_all()),
+        len(repo.list_all()),
     )
 
     yield  # ── Application is running ──
