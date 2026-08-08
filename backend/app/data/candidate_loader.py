@@ -77,6 +77,10 @@ class CurriculumTopic(DataRecord):
 
     topic_id: str
     title: str | None = None
+    day: int | None = Field(default=None, ge=1)
+    type: str | None = None
+    tools: list[str] = Field(default_factory=list)
+    objectives: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -84,7 +88,11 @@ class CurriculumTopic(DataRecord):
         if not isinstance(value, dict):
             return value
         record = dict(value)
-        record.setdefault("topic_id", record.get("topicId", record.get("id")))
+        day = record.get("day")
+        record.setdefault(
+            "topic_id",
+            record.get("topicId", record.get("id", f"day-{day}" if day is not None else None)),
+        )
         record.setdefault("title", record.get("name"))
         return record
 
@@ -97,7 +105,11 @@ class CurriculumDocument(DataRecord):
     @model_validator(mode="before")
     @classmethod
     def normalise_root(cls, value: Any) -> Any:
-        return {"topics": value} if isinstance(value, list) else value
+        if isinstance(value, list):
+            return {"topics": value}
+        if isinstance(value, dict) and "topics" not in value and isinstance(value.get("days"), list):
+            return {**value, "topics": value["days"]}
+        return value
 
 
 def load_candidates() -> list[Candidate]:
