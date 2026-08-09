@@ -406,6 +406,95 @@ class InterviewService:
         ranked_topics.sort(key=rank_topic, reverse=True)
         return ranked_topics[0]
 
+    def _select_adaptive_action(
+        self,
+        evaluation: AnswerEvaluation,
+        current_plan: QuestionPlan,
+        next_difficulty: DifficultyLevel,
+        competency_states: dict[str, CompetencyState],
+        questions_asked: int,
+    ) -> AdaptiveAction:
+        """Select the adaptive action BEFORE choosing the next topic.
+
+        Uses multiple signals:
+        - evaluation.score (0–10)
+        - evaluation.follow_up_needed
+        - evaluation.misconceptions
+        - evaluation.weaknesses
+        - evaluation.missing_concepts
+        - competency-level evidence (questions asked, proficiency)
+        - difficulty change direction
+
+        The action drives topic selection, not the reverse.
+        """
+        score = evaluation.score  # 0–10 scale
+        overall = evaluation.overall_score or (score * 10)  # 0–100 scale
+        has_follow_up = evaluation.follow_up_needed
+        has_misconceptions = bool(evaluation.misconceptions)
+        has_weaknesses = bool(evaluation.weaknesses)
+        has_missing = bool(evaluation.missing_concepts)
+
+        comp_state = competency_states.get(current_plan.competency_id)
+        comp_questions = comp_state.questions_asked if comp_state else 1
+
+        difficulty_order = [
+            DifficultyLevel.FOUNDATIONAL,
+            DifficultyLevel.INTERMEDIATE,
+            DifficultyLevel.ADVANCED,
+            DifficultyLevel.EXPERT,
+        ]
+        diff_increased = difficulty_order.index(next_difficulty) > difficulty_order.index(current_plan.target_difficulty)
+        diff_decreased = difficulty_order.index(next_difficulty) < difficulty_order.index(current_plan.target_difficulty)
+
+        # ── Strong performance (score ≥ 7.5) ───────────────────────
+        if score >= 7.5:
+            if diff_increased:
+                return AdaptiveAction.INCREASE_DIFFICULTY
+            # Strong answer + already at max difficulty or enough evidence
+            if comp_questions >= 2:
+                return AdaptiveAction.SWITCH_TOPIC
+            return AdaptiveAction.INCREASE_DIFFICULTY
+
+        # ── Weak performance with misconceptions (score ≤ 4.0) ──────
+        if score <= 4.0:
+            if has_misconceptions:
+                # Stay on same topic to address misconception
+                return AdaptiveAction.CONTINUE_SAME_TOPIC
+            if diff_decreased:
+                return AdaptiveAction.DECREASE_DIFFICULTY
+            # Weak but no misconceptions — deep dive to understand gap
+            if has_follow_up or has_missing:
+                return AdaptiveAction.DEEP_DIVE
+            return AdaptiveAction.DECREASE_DIFFICULTY
+
+        # ── Moderate-weak performance (4.0 < score < 5.5) ───────────
+        if score < 5.5:
+            if has_misconceptions:
+                return AdaptiveAction.CONTINUE_SAME_TOPIC
+            if has_follow_up and (has_weaknesses or has_missing):
+                return AdaptiveAction.DEEP_DIVE
+            if comp_questions >= 2:
+                return AdaptiveAction.SWITCH_TOPIC
+            return AdaptiveAction.CONTINUE_SAME_TOPIC
+
+        # ── Moderate performance (5.5 ≤ score < 7.0) ───────────────
+        if score < 7.0:
+            if has_follow_up and has_missing:
+                return AdaptiveAction.DEEP_DIVE
+            if comp_questions >= 2:
+                # Adequate evidence for this competency — broaden
+                return AdaptiveAction.SWITCH_TOPIC
+            if has_weaknesses:
+                return AdaptiveAction.CONTINUE_SAME_TOPIC
+            return AdaptiveAction.SWITCH_TOPIC
+
+        # ── Good performance (7.0 ≤ score < 7.5) ───────────────────
+        if diff_increased:
+            return AdaptiveAction.INCREASE_DIFFICULTY
+        if comp_questions >= 2:
+            return AdaptiveAction.SWITCH_TOPIC
+        return AdaptiveAction.CONTINUE_SAME_TOPIC
+
     def _build_question_plan(
         self,
         candidate,
@@ -416,7 +505,46 @@ class InterviewService:
         retriever: LocalCurriculumRetriever,
         next_difficulty: DifficultyLevel,
     ) -> tuple[str, str, DifficultyLevel, QuestionPlan, AdaptiveDecision]:
-        next_topic = self._select_next_topic(candidate, session, evaluation, current_plan, curriculum_repo, retriever)
+        # ── Step 1: Select adaptive action FIRST (evidence-driven) ──
+        raw_comp_states = session.metadata.get("competency_states", {})
+        competency_states: dict[str, CompetencyState] = {
+            cid: CompetencyState.model_validate(data)
+            for cid, data in raw_comp_states.items()
+            if isinstance(data, dict)
+        }
+
+        action = self._select_adaptive_action(
+            evaluation=evaluation,
+            current_plan=current_plan,
+            next_difficulty=next_difficulty,
+            competency_states=competency_states,
+            questions_asked=session.questions_asked,
+        )
+
+        # ── Step 2: Select topic based on action ────────────────────
+        # For continue/deep_dive: stay on current topic
+        # For switch/increase (at max evidence)/decrease: select new topic
+        stay_on_topic = action in (
+            AdaptiveAction.CONTINUE_SAME_TOPIC,
+            AdaptiveAction.DEEP_DIVE,
+        )
+
+        if stay_on_topic:
+            current_topic_obj = curriculum_repo.get_by_id(current_plan.competency_id)
+            if current_topic_obj is not None:
+                next_topic = current_topic_obj
+            else:
+                # Fallback: select a new topic if current is unavailable
+                next_topic = self._select_next_topic(
+                    candidate, session, evaluation, current_plan,
+                    curriculum_repo, retriever,
+                )
+        else:
+            next_topic = self._select_next_topic(
+                candidate, session, evaluation, current_plan,
+                curriculum_repo, retriever,
+            )
+
         topic_name = self._topic_name(next_topic)
 
         question_type = QuestionType.CONCEPTUAL
@@ -428,6 +556,20 @@ class InterviewService:
         retrieval_results = retriever.search(topic_name, limit=1)
         topic_context = retrieval_results[0].title if retrieval_results else topic_name
         objectives = retrieval_results[0].objectives if retrieval_results else list(next_topic.objectives)
+
+        # Build selection reasoning based on action
+        action_desc = {
+            AdaptiveAction.CONTINUE_SAME_TOPIC: f"Continuing on {topic_name} to deepen assessment",
+            AdaptiveAction.INCREASE_DIFFICULTY: f"Increasing difficulty for {topic_name} after strong performance",
+            AdaptiveAction.DECREASE_DIFFICULTY: f"Decreasing difficulty for {topic_name} to build confidence",
+            AdaptiveAction.SWITCH_TOPIC: f"Switching to {topic_name} to broaden competency coverage",
+            AdaptiveAction.DEEP_DIVE: f"Probing deeper into {topic_name} to clarify gaps",
+            AdaptiveAction.CONCLUDE_INTERVIEW: f"Concluding interview with sufficient evidence",
+        }
+        selection_reasoning = (
+            f"{action_desc.get(action, 'Selected ' + topic_name)}. "
+            f"Previous answer scored {evaluation.score:.1f}/10."
+        )
 
         plan = QuestionPlan(
             plan_id=f"qp-{uuid.uuid4().hex[:8]}",
@@ -441,7 +583,7 @@ class InterviewService:
                 f"Explain the core idea behind {topic_name}",
                 *[objective for objective in objectives[:2]],
             ],
-            selection_reasoning=f"Selected {topic_name} after evaluating the previous answer at score {evaluation.score:.1f}.",
+            selection_reasoning=selection_reasoning,
         )
 
         question_text = self._build_question_text(
@@ -453,28 +595,13 @@ class InterviewService:
         )
         plan.generated_question_text = question_text
 
-        difficulty_order = [
-            DifficultyLevel.FOUNDATIONAL,
-            DifficultyLevel.INTERMEDIATE,
-            DifficultyLevel.ADVANCED,
-            DifficultyLevel.EXPERT,
-        ]
-        if difficulty_order.index(next_difficulty) > difficulty_order.index(current_plan.target_difficulty):
-            action = AdaptiveAction.INCREASE_DIFFICULTY
-        elif difficulty_order.index(next_difficulty) < difficulty_order.index(current_plan.target_difficulty):
-            action = AdaptiveAction.DECREASE_DIFFICULTY
-        elif next_topic.topic_id == current_plan.competency_id:
-            action = AdaptiveAction.CONTINUE_SAME_TOPIC
-        else:
-            action = AdaptiveAction.SWITCH_TOPIC
-
         decision = AdaptiveDecision(
             decision_id=f"dec-{uuid.uuid4().hex[:8]}",
             evaluation_id=evaluation.evaluation_id,
             action=action,
             next_competency_id=next_topic.topic_id,
             next_difficulty=next_difficulty,
-            reasoning=plan.selection_reasoning,
+            reasoning=selection_reasoning,
         )
 
         return question_text, topic_name, next_difficulty, plan, decision
@@ -938,11 +1065,19 @@ class InterviewService:
         # Centralized mapping via FinalReportGenerator.report_to_summary_fields
         report_fields = FinalReportGenerator.report_to_summary_fields(report)
 
+        # Derive accurate counts from actual evaluated data
+        responses_evaluated = len(evaluation_history)
+        competencies_assessed = len(set(
+            e.competency_id for e in evaluation_history
+        ))
+
         return InterviewSummary(
             session_id=session.session_id,
             candidate_id=session.candidate_id,
             status=session.status,
             total_questions=session.questions_asked,
+            responses_evaluated=responses_evaluated,
+            competencies_assessed=competencies_assessed,
             duration_seconds=round(duration, 2),
             topics_covered=topics_covered,
             **report_fields,

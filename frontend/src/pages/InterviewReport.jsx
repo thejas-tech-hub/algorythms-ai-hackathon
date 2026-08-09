@@ -3,15 +3,21 @@ import FinalReport from '../components/FinalReport';
 
 /**
  * InterviewReport — Page 4.
- * Displays the final interview report returned by the backend.
+ * Displays the Candidate Intelligence Report.
  *
  * Props:
- *   report    (object) — final report data
+ *   report    (object) — { report, journeyData, competencyEvidence } or raw report
  *   candidate (object) — candidate data
  *   onRestart (fn)     — navigate back to candidate selection
  */
 export default function InterviewReport({ report, candidate, onRestart }) {
   const candidateName = candidate?.name || 'Candidate';
+
+  // report may be wrapped { report, journeyData, competencyEvidence }
+  // or may be a raw report object
+  const actualReport = report?.report ?? report;
+  const journeyData = report?.journeyData ?? [];
+  const competencyEvidence = report?.competencyEvidence ?? {};
 
   return (
     <div className="page page--report">
@@ -32,15 +38,20 @@ export default function InterviewReport({ report, candidate, onRestart }) {
 
       <main className="page-main page-main--report" id="main-content">
         <div className="report-page-title">
-          <h1>Interview Report</h1>
+          <h1>Candidate Intelligence Report</h1>
           <p className="report-page-subtitle">
             {candidateName}
             {candidate?.role && <span className="report-page-role"> · {candidate.role}</span>}
           </p>
         </div>
 
-        {report ? (
-          <FinalReport report={report} />
+        {actualReport ? (
+          <FinalReport
+            report={actualReport}
+            candidate={candidate}
+            journeyData={journeyData}
+            competencyEvidence={competencyEvidence}
+          />
         ) : (
           <div className="empty-state">
             <div className="empty-state__icon" aria-hidden="true">📋</div>

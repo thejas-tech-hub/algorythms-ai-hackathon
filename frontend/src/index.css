@@ -36,6 +36,10 @@
   --warning-dim:         rgba(251, 191, 36, 0.12);
   --danger:              #f87171;
   --danger-dim:          rgba(248, 113, 113, 0.12);
+  --info:                #60a5fa;
+  --info-dim:            rgba(96, 165, 250, 0.12);
+  --expert:              #c084fc;
+  --expert-dim:          rgba(192, 132, 252, 0.12);
 
   /* Typography */
   --font-sans:           'Inter', system-ui, -apple-system, sans-serif;
@@ -188,6 +192,11 @@ p {
 .btn--full {
   width: 100%;
   justify-content: center;
+}
+
+.btn--sm {
+  font-size: 12.5px;
+  padding: 5px 10px;
 }
 
 /* ── Badges ───────────────────────────────────────────────── */

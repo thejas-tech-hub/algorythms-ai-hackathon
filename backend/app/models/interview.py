@@ -78,6 +78,8 @@ class InterviewSummary(BaseSchema):
     candidate_id: str
     status: InterviewStatus
     total_questions: int
+    responses_evaluated: int | None = None
+    competencies_assessed: int | None = None
     duration_seconds: float | None = None
     topics_covered: list[str] = Field(default_factory=list)
 

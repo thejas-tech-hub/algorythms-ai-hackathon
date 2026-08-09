@@ -52,13 +52,18 @@ def test_submit_answer_advances_session_state() -> None:
     assert updated.question == updated.current_question
     assert updated.questions_asked == 2
     assert updated.question_number == 2
-    assert updated.current_topic != previous_topic
+    # Topic may stay the same for continue_same_topic/deep_dive actions
+    assert updated.current_topic
     assert updated.difficulty in DifficultyLevel
     assert updated.metadata["active_question_plan_id"] != previous_plan_id
     assert updated.metadata["active_question_plan"]["generated_question_text"] == updated.current_question
     assert updated.metadata["last_evaluation"]["plan_id"] == previous_plan_id
     assert updated.metadata["last_answer_evaluation"]["overall_score"] >= 0
     assert updated.metadata["evaluation_history"]
+    assert updated.metadata["last_adaptive_decision"]["action"] in [
+        "continue_same_topic", "increase_difficulty", "decrease_difficulty",
+        "switch_topic", "deep_dive", "conclude_interview",
+    ]
     assert any(message.role == "candidate" and "embeddings encode semantic meaning" in message.content for message in updated.messages)
     assert updated.messages[-1].role == "interviewer"
     assert updated.messages[-1].content == updated.current_question
@@ -153,7 +158,10 @@ def test_consecutive_answers_keep_advancing_questions_and_topics() -> None:
     assert second_answered.question_number == 3
     assert second_answered.current_question
     assert second_answered.current_question != first_followup_question
-    assert second_answered.current_topic != first_followup_topic
+    # Topic may stay the same for continue/deep_dive adaptive actions
+    assert second_answered.current_topic
     assert second_answered.metadata["active_question_plan"]["generated_question_text"] == second_answered.current_question
     assert len([message for message in second_answered.messages if message.role == "candidate"]) == 2
     assert len([message for message in second_answered.messages if message.role == "interviewer"]) >= 3
+    # Verify adaptive decisions are tracked
+    assert len(second_answered.metadata.get("decision_history", [])) >= 2
