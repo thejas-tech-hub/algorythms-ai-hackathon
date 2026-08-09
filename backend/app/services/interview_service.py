@@ -3,8 +3,8 @@ Interview session orchestration.
 Owner: THEJAS
 
 Manages the full interview session lifecycle: create -> ask -> respond -> end.
-All adaptive logic (question selection, evaluation, scoring) is stubbed
-with TODO markers for future implementation.
+Adaptive intelligence (competency tracking, session memory, final reporting)
+is delegated to SessionIntelligence modules in session_intelligence.py.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from app.models.adaptive import (
     AdaptiveDecision,
     AnswerEvaluation,
     CandidateIntelligenceProfile,
+    CompetencyState,
     EvidenceStrength,
     QuestionPlan,
     QuestionType,
@@ -37,6 +38,12 @@ from app.models.interview import (
 )
 from app.services.candidate_service import CandidateService
 from app.services.curriculum_retrieval import LocalCurriculumRetriever
+from app.services.session_intelligence import (
+    AdaptiveReasoningEnhancer,
+    CompetencyTracker,
+    FinalReportGenerator,
+    SessionMemoryManager,
+)
 
 logger = get_logger(__name__)
 
@@ -616,12 +623,25 @@ class InterviewService:
             selected_topic_id=question_plan.competency_id,
             suggested_difficulty=difficulty,
         )
+        # ── Session intelligence initialisation ────────────────────
+        initial_snapshot = SessionMemoryManager.create_initial_snapshot(
+            session_id=session.session_id,
+            candidate_id=candidate.candidate_id,
+            first_plan=question_plan,
+            difficulty=difficulty,
+        )
+
         session.metadata.update(
             {
                 "active_question_plan": question_plan.model_dump(mode="json"),
                 "active_question_plan_id": question_plan.plan_id,
                 "candidate_intelligence": intelligence.model_dump(mode="json"),
                 "asked_topic_ids": [question_plan.competency_id],
+                "competency_states": {},
+                "session_memory_snapshot": initial_snapshot.model_dump(mode="json"),
+                "snapshot_index": 0,
+                "plan_history": [question_plan.model_dump(mode="json")],
+                "decision_history": [],
             }
         )
 
@@ -679,6 +699,31 @@ class InterviewService:
             question_plan=current_plan,
             topic_name=session.current_topic or current_plan.topic_context or current_plan.competency_id,
         )
+
+        evaluation_trace = {
+            "evaluation_id": evaluation.evaluation_id,
+            "plan_id": current_plan.plan_id,
+            "competency_id": current_plan.competency_id,
+            "competency_title": current_plan.topic_context or current_plan.objective or current_plan.competency_id,
+            "question_text": current_plan.generated_question_text or current_plan.objective,
+            "candidate_answer": answer.answer,
+            "scores": {
+                "score": evaluation.score,
+                "overall_score": evaluation.overall_score,
+                "conceptual_correctness_score": evaluation.conceptual_correctness_score,
+                "depth_reasoning_score": evaluation.depth_reasoning_score,
+                "practical_understanding_score": evaluation.practical_understanding_score,
+                "confidence_score": evaluation.confidence_score,
+                "evidence_score": evaluation.evidence_score,
+            },
+            "strengths": list(evaluation.strengths),
+            "weaknesses": list(evaluation.weaknesses),
+            "missing_concepts": list(evaluation.missing_concepts),
+            "misconceptions": list(evaluation.misconceptions),
+            "evaluation": evaluation.model_dump(mode="json"),
+            "question_plan": current_plan.model_dump(mode="json"),
+        }
+
         next_difficulty = self._next_difficulty(session.difficulty, evaluation)
 
         question_text, current_topic, difficulty, question_plan, decision = self._build_question_plan(
@@ -706,15 +751,95 @@ class InterviewService:
         if not isinstance(evaluation_history, list):
             evaluation_history = []
         evaluation_history.append(evaluation.model_dump(mode="json"))
+
+        # ── Session intelligence: competency tracking ───────────────
+        raw_comp_states = session.metadata.get("competency_states", {})
+        competency_states: dict[str, CompetencyState] = {
+            cid: CompetencyState.model_validate(data)
+            for cid, data in raw_comp_states.items()
+            if isinstance(data, dict)
+        }
+
+        # Collect ALL evaluations for the current competency
+        evals_for_comp = [
+            AnswerEvaluation.model_validate(ev_data)
+            for ev_data in evaluation_history
+            if isinstance(ev_data, dict)
+            and ev_data.get("competency_id") == current_plan.competency_id
+        ]
+
+        updated_state = CompetencyTracker.update_competency_state(
+            competency_id=current_plan.competency_id,
+            evaluation=evaluation,
+            question_plan=current_plan,
+            current_states=competency_states,
+            evaluation_history_for_competency=evals_for_comp,
+        )
+        competency_states[current_plan.competency_id] = updated_state
+
+        # ── Session intelligence: enhanced adaptive reasoning ───────
+        decision.reasoning = AdaptiveReasoningEnhancer.enhance_reasoning(
+            evaluation=evaluation,
+            competency_state=updated_state,
+            decision=decision,
+        )
+        session.metadata["next_question_reason"] = decision.reasoning
+
+        # ── Session intelligence: session memory snapshot ───────────
+        plan_history_raw = session.metadata.get("plan_history", [])
+        plan_history_raw.append(question_plan.model_dump(mode="json"))
+
+        decision_history_raw = session.metadata.get("decision_history", [])
+        decision_history_raw.append(decision.model_dump(mode="json"))
+
+        evaluation_trace_history = session.metadata.get("evaluation_traces", [])
+        if not isinstance(evaluation_trace_history, list):
+            evaluation_trace_history = []
+        evaluation_trace_history.append(evaluation_trace)
+
+        snapshot_index = session.metadata.get("snapshot_index", 0) + 1
+
+        topics_covered = list(dict.fromkeys(asked_topic_ids))  # unique, ordered
+
+        snapshot = SessionMemoryManager.create_snapshot(
+            session_id=session.session_id,
+            candidate_id=session.candidate_id,
+            snapshot_index=snapshot_index,
+            competency_states=list(competency_states.values()),
+            plan_history=[
+                QuestionPlan.model_validate(p) for p in plan_history_raw if isinstance(p, dict)
+            ],
+            evaluation_history=[
+                AnswerEvaluation.model_validate(e) for e in evaluation_history if isinstance(e, dict)
+            ],
+            decision_history=[
+                AdaptiveDecision.model_validate(d) for d in decision_history_raw if isinstance(d, dict)
+            ],
+            current_difficulty=difficulty,
+            current_competency_id=question_plan.competency_id,
+            total_questions_asked=session.questions_asked,
+            topics_covered=topics_covered,
+        )
+
         session.metadata.update(
             {
                 "active_question_plan": question_plan.model_dump(mode="json"),
                 "active_question_plan_id": question_plan.plan_id,
                 "last_answer_evaluation": evaluation.model_dump(mode="json"),
                 "evaluation_history": evaluation_history,
+                "evaluation_traces": evaluation_trace_history,
+                "last_evaluation_trace": evaluation_trace,
                 "last_evaluation": evaluation.model_dump(mode="json"),
                 "last_adaptive_decision": decision.model_dump(mode="json"),
                 "asked_topic_ids": asked_topic_ids,
+                "competency_states": {
+                    cid: state.model_dump(mode="json")
+                    for cid, state in competency_states.items()
+                },
+                "session_memory_snapshot": snapshot.model_dump(mode="json"),
+                "snapshot_index": snapshot_index,
+                "plan_history": plan_history_raw,
+                "decision_history": decision_history_raw,
             }
         )
         session.updated_at = datetime.utcnow()
@@ -729,7 +854,7 @@ class InterviewService:
 
     def end_session(self, session_id: str) -> InterviewSummary:
         """
-        End a session and produce a summary.
+        End a session and produce a summary with full FinalInterviewReport data.
 
         Raises:
             SessionNotFoundError: If the session does not exist.
@@ -746,13 +871,61 @@ class InterviewService:
 
         duration = (session.updated_at - session.created_at).total_seconds()
 
-        # ------------------------------------------------------------------
-        # TODO: Generate comprehensive interview summary
-        # - Score each topic covered
-        # - Identify strengths and weaknesses
-        # - Produce a hiring recommendation
-        # - Generate detailed feedback via AI engine
-        # ------------------------------------------------------------------
+        # ── Reconstruct session intelligence state ──────────────────
+        raw_comp_states = session.metadata.get("competency_states", {})
+        competency_states: dict[str, CompetencyState] = {
+            cid: CompetencyState.model_validate(data)
+            for cid, data in raw_comp_states.items()
+            if isinstance(data, dict)
+        }
+
+        evaluation_history_raw = session.metadata.get("evaluation_history", [])
+        evaluation_history = [
+            AnswerEvaluation.model_validate(e)
+            for e in evaluation_history_raw
+            if isinstance(e, dict)
+        ]
+
+        decision_history_raw = session.metadata.get("decision_history", [])
+        decision_history = [
+            AdaptiveDecision.model_validate(d)
+            for d in decision_history_raw
+            if isinstance(d, dict)
+        ]
+
+        evaluation_traces_raw = session.metadata.get("evaluation_traces", [])
+        evaluation_traces = [
+            trace for trace in evaluation_traces_raw
+            if isinstance(trace, dict)
+        ]
+
+        plan_history_raw = session.metadata.get("plan_history", [])
+        plan_history = [
+            QuestionPlan.model_validate(p)
+            for p in plan_history_raw
+            if isinstance(p, dict)
+        ]
+
+        topics_covered = list(dict.fromkeys(
+            session.metadata.get("asked_topic_ids", [])
+        ))
+
+        # ── Generate FinalInterviewReport (canonical model) ─────────
+        report = FinalReportGenerator.generate_report(
+            session_id=session.session_id,
+            candidate_id=session.candidate_id,
+            competency_states=competency_states,
+            evaluation_history=evaluation_history,
+            decision_history=decision_history,
+            plan_history=plan_history,
+            total_questions=session.questions_asked,
+            duration_seconds=round(duration, 2),
+            topics_covered=topics_covered,
+        )
+
+        # Store the report in session metadata for auditability
+        session.metadata["final_report"] = report.model_dump(mode="json")
+        self._save_session(session)
 
         logger.info(
             "Session %s ended. %d questions, %.1fs duration",
@@ -761,11 +934,16 @@ class InterviewService:
             duration,
         )
 
+        # ── Map FinalInterviewReport → InterviewSummary ─────────────
+        # Centralized mapping via FinalReportGenerator.report_to_summary_fields
+        report_fields = FinalReportGenerator.report_to_summary_fields(report)
+
         return InterviewSummary(
             session_id=session.session_id,
             candidate_id=session.candidate_id,
             status=session.status,
             total_questions=session.questions_asked,
             duration_seconds=round(duration, 2),
-            topics_covered=[],  # TODO: populate from session state
+            topics_covered=topics_covered,
+            **report_fields,
         )

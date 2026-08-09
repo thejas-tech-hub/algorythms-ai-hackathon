@@ -66,7 +66,13 @@ class InterviewSession(BaseSchema):
 
 
 class InterviewSummary(BaseSchema):
-    """Summary returned when an interview session ends."""
+    """Summary returned when an interview session ends.
+
+    Carries optional FinalInterviewReport data as an additive
+    compatibility layer for the frontend.  The canonical report model
+    (``FinalInterviewReport``) remains the internal source of truth;
+    mapping is handled by ``FinalReportGenerator.report_to_summary_fields()``.
+    """
 
     session_id: str
     candidate_id: str
@@ -75,10 +81,12 @@ class InterviewSummary(BaseSchema):
     duration_seconds: float | None = None
     topics_covered: list[str] = Field(default_factory=list)
 
-    # ------------------------------------------------------------------
-    # TODO: Add these fields when scoring / feedback is implemented
-    # ------------------------------------------------------------------
-    # overall_score: float | None = None
-    # strengths: list[str] = Field(default_factory=list)
-    # areas_for_improvement: list[str] = Field(default_factory=list)
-    # recommendation: str | None = None
+    # ── Report fields (additive compatibility layer) ─────────────────
+    overall_score: float | None = None
+    recommendation: str | None = None
+    competency_scores: list[dict] | None = None
+    strengths: list[str] = Field(default_factory=list)
+    areas_for_improvement: list[str] = Field(default_factory=list)
+    summary: str | None = None
+    executive_summary: str | None = None
+    detailed_feedback: str | None = None
