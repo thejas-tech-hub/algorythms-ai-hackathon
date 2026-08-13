@@ -170,6 +170,10 @@ class CompetencyState(BaseSchema):
         default_factory=list,
         description="Evaluator notes supporting the proficiency rating",
     )
+    assessed_criteria: list[str] = Field(
+        default_factory=list,
+        description="Criteria/objectives already assessed for this competency",
+    )
 
 
 # ── Candidate Intelligence ───────────────────────────────────────────
@@ -311,6 +315,22 @@ class QuestionPlan(BaseSchema):
     generated_question_text: str | None = Field(
         default=None,
         description="Populated after the Question Generator produces the text",
+    )
+    target_gap: str | None = Field(
+        default=None,
+        description="The specific gap, misconception, or weakness this question targets",
+    )
+    question_intent: str | None = Field(
+        default=None,
+        description="What kind of evidence this question seeks (e.g. 'probe misconception', 'assess practical depth')",
+    )
+    evidence_basis: list[str] = Field(
+        default_factory=list,
+        description="Evaluation evidence items that drove the creation of this plan",
+    )
+    assessed_objectives: list[str] = Field(
+        default_factory=list,
+        description="Objectives already assessed for this competency (for rotation)",
     )
 
 

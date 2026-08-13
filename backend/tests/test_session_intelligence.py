@@ -1303,3 +1303,264 @@ class TestInterviewServiceIntegration:
 
         # Check snapshot index advanced
         assert session.metadata.get("snapshot_index", 0) == 3
+
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 15: GROUNDING REGRESSION TESTS
+# ═════════════════════════════════════════════════════════════════════
+
+
+class TestGroundingRegression:
+    """Regression tests for report grounding (no unrelated data leaks)."""
+
+    def _run_session(self, num_answers: int = 3) -> tuple:
+        """Helper: create a session, submit N answers, end session. Returns (service, session, summary)."""
+        service = _build_service()
+        session = service.create_session(InterviewSessionCreate(candidate_id="CAND-001"))
+
+        strong = "I would implement this using vector embeddings for semantic retrieval. The key trade-off is between precision and recall, because smaller chunks improve matching but lose context."
+        moderate = "This topic relates to data processing and system performance. We need to consider scaling trade-offs."
+        weak = "Maybe it's about optimization. Not sure about the details."
+        answers = [strong, moderate, weak, strong, moderate, weak, strong, moderate]
+
+        for i in range(num_answers):
+            session = service.submit_answer(
+                session.session_id,
+                CandidateAnswer(answer=answers[i % len(answers)]),
+            )
+
+        summary = service.end_session(session.session_id)
+        ended = service.get_session(session.session_id)
+        return service, ended, summary
+
+    def test_no_unrelated_competencies_in_report(self):
+        """Every competency in the final report must originate from an actual
+        QuestionPlan used during the current session."""
+        _, ended, summary = self._run_session(3)
+
+        eval_history = ended.metadata.get("evaluation_history", [])
+        evaluated_comp_ids = set(e["competency_id"] for e in eval_history if isinstance(e, dict))
+
+        # Every competency score must reference an evaluated competency
+        for cs in summary.competency_scores:
+            assert cs["competency_id"] in evaluated_comp_ids, (
+                f"Competency {cs['competency_id']} in report has no evaluation evidence"
+            )
+
+    def test_no_unrelated_missing_concepts(self):
+        """Every missing concept in the report must come from a session evaluation."""
+        _, ended, summary = self._run_session(3)
+
+        eval_history = ended.metadata.get("evaluation_history", [])
+        all_session_missing = set()
+        for e in eval_history:
+            if isinstance(e, dict):
+                for mc in e.get("missing_concepts", []):
+                    all_session_missing.add(mc)
+
+        # Every improvement that starts with "Missing concept:" must be from session
+        for item in summary.areas_for_improvement:
+            if item.startswith("Missing concept: "):
+                mc = item[len("Missing concept: "):]
+                assert mc in all_session_missing, (
+                    f"Missing concept '{mc}' not found in any session evaluation"
+                )
+
+    def test_report_contains_only_current_session_questions(self):
+        """topics_covered must only reference topics that were actually evaluated."""
+        _, ended, summary = self._run_session(3)
+
+        eval_history = ended.metadata.get("evaluation_history", [])
+        evaluated_comp_ids = set(e["competency_id"] for e in eval_history if isinstance(e, dict))
+        topic_titles = dict(ended.metadata.get("topic_titles", {}))
+
+        # Each topic_covered must map to an evaluated competency
+        for topic_title in summary.topics_covered:
+            # Find the comp_id(s) that map to this title
+            matching_ids = [cid for cid, title in topic_titles.items() if title == topic_title]
+            assert any(cid in evaluated_comp_ids for cid in matching_ids), (
+                f"Topic '{topic_title}' in topics_covered has no evaluation evidence"
+            )
+
+    def test_strengths_come_from_evaluations(self):
+        """Every strength must originate from at least one evaluation."""
+        _, ended, summary = self._run_session(3)
+
+        eval_history = ended.metadata.get("evaluation_history", [])
+        all_session_strengths = set()
+        for e in eval_history:
+            if isinstance(e, dict):
+                for s in e.get("strengths", []):
+                    all_session_strengths.add(s)
+
+        for s in summary.strengths:
+            assert s in all_session_strengths, (
+                f"Strength '{s}' not found in any session evaluation"
+            )
+
+    def test_weaknesses_come_from_evaluations(self):
+        """Every weakness/improvement must trace to an evaluation."""
+        _, ended, summary = self._run_session(3)
+
+        eval_history = ended.metadata.get("evaluation_history", [])
+        all_session_weaknesses = set()
+        all_session_missing = set()
+        all_session_misconceptions = set()
+        for e in eval_history:
+            if isinstance(e, dict):
+                for w in e.get("weaknesses", []):
+                    all_session_weaknesses.add(w)
+                for mc in e.get("missing_concepts", []):
+                    all_session_missing.add(mc)
+                for m in e.get("misconceptions", []):
+                    all_session_misconceptions.add(m)
+
+        for item in summary.areas_for_improvement:
+            if item.startswith("Missing concept: "):
+                mc = item[len("Missing concept: "):]
+                assert mc in all_session_missing, f"'{mc}' not in session missing concepts"
+            elif item.startswith("Misconception: "):
+                m = item[len("Misconception: "):]
+                assert m in all_session_misconceptions, f"'{m}' not in session misconceptions"
+            else:
+                assert item in all_session_weaknesses, f"'{item}' not in session weaknesses"
+
+    def test_adaptive_decision_references_actual_evaluation(self):
+        """The adaptive decision reasoning must reference real evaluation data."""
+        service = _build_service()
+        session = service.create_session(InterviewSessionCreate(candidate_id="CAND-001"))
+        session = service.submit_answer(
+            session.session_id,
+            CandidateAnswer(answer="I implement this using embeddings and retrieval trade-offs."),
+        )
+
+        decision = session.metadata.get("last_adaptive_decision", {})
+        reasoning = decision.get("reasoning", "")
+
+        # Reasoning must not be empty/generic
+        assert len(reasoning) > 30
+        # Must reference actual evaluation data (score, performance, etc.)
+        assert any(word in reasoning.lower() for word in ("score", "performance", "proficiency", "confidence", "demonstrated"))
+
+    def test_two_sessions_remain_isolated(self):
+        """Two separate sessions must not leak data into each other."""
+        service1 = _build_service()
+        session1 = service1.create_session(InterviewSessionCreate(candidate_id="CAND-001"))
+        session1 = service1.submit_answer(
+            session1.session_id,
+            CandidateAnswer(answer="Detailed answer about embeddings, chunking, and retrieval architecture."),
+        )
+        service1.submit_answer(
+            session1.session_id,
+            CandidateAnswer(answer="Trade-off between precision and recall in vector search."),
+        )
+        summary1 = service1.end_session(session1.session_id)
+
+        service2 = _build_service()
+        session2 = service2.create_session(InterviewSessionCreate(candidate_id="CAND-002"))
+        service2.submit_answer(
+            session2.session_id,
+            CandidateAnswer(answer="Maybe vectors?"),
+        )
+        summary2 = service2.end_session(session2.session_id)
+
+        # Sessions must have independent data
+        assert summary1.session_id != summary2.session_id
+        assert summary1.overall_score != summary2.overall_score
+
+        # Competency scores must not leak between sessions
+        comp_ids_1 = {cs["competency_id"] for cs in summary1.competency_scores}
+        comp_ids_2 = {cs["competency_id"] for cs in summary2.competency_scores}
+        # Even if they overlap on curriculum topics, the evidence counts must be independent
+        ended1 = service1.get_session(session1.session_id)
+        ended2 = service2.get_session(session2.session_id)
+        eval_count_1 = len(ended1.metadata.get("evaluation_history", []))
+        eval_count_2 = len(ended2.metadata.get("evaluation_history", []))
+        assert eval_count_1 == 2  # session1 had 2 answers
+        assert eval_count_2 == 1  # session2 had 1 answer
+
+    def test_report_with_1_evaluated_question(self):
+        """Report must work correctly with a single evaluated question."""
+        _, _, summary = self._run_session(1)
+
+        assert summary.overall_score is not None
+        assert summary.overall_score > 0.0
+        assert summary.recommendation is not None
+        assert len(summary.competency_scores) >= 1
+        assert summary.recommendation == "needs_further_evaluation"
+
+    def test_report_with_3_evaluated_questions(self):
+        """Report must work correctly with 3 evaluated questions."""
+        _, ended, summary = self._run_session(3)
+
+        eval_count = len(ended.metadata.get("evaluation_history", []))
+        assert eval_count == 3
+
+        assert summary.overall_score is not None
+        assert summary.overall_score > 0.0
+        assert len(summary.competency_scores) >= 1
+        assert all(cs["evidence_count"] >= 1 for cs in summary.competency_scores)
+
+    def test_report_with_8_evaluated_questions(self):
+        """Report must work correctly with 8 evaluated questions (simulated)."""
+        _, ended, summary = self._run_session(8)
+
+        eval_count = len(ended.metadata.get("evaluation_history", []))
+        assert eval_count == 8
+
+        assert summary.overall_score is not None
+        assert summary.overall_score > 0.0
+        assert len(summary.competency_scores) >= 1
+
+        # Total evidence across all competencies must equal 8
+        total_evidence = sum(cs["evidence_count"] for cs in summary.competency_scores)
+        assert total_evidence == 8
+
+    def test_insufficient_evidence_produces_needs_further(self):
+        """A session with only 1 question must produce NEEDS_FURTHER_EVALUATION."""
+        _, _, summary = self._run_session(1)
+        assert summary.recommendation == "needs_further_evaluation"
+
+    def test_topics_covered_uses_titles_not_raw_ids(self):
+        """topics_covered in the report must use human-readable titles,
+        not raw curriculum IDs like 'day-29'."""
+        _, _, summary = self._run_session(3)
+
+        for topic in summary.topics_covered:
+            # Raw IDs look like 'day-1', 'day-29', etc.
+            assert not topic.startswith("day-"), (
+                f"Raw curriculum ID '{topic}' leaked into topics_covered"
+            )
+
+    def test_evaluated_topic_ids_excludes_unanswered_question(self):
+        """evaluated_topic_ids must NOT include the next planned but unanswered question."""
+        service = _build_service()
+        session = service.create_session(InterviewSessionCreate(candidate_id="CAND-001"))
+
+        # Submit 2 answers → 3 questions were asked (including the unanswered next one)
+        session = service.submit_answer(
+            session.session_id,
+            CandidateAnswer(answer="Detailed answer about the topic with trade-offs."),
+        )
+        session = service.submit_answer(
+            session.session_id,
+            CandidateAnswer(answer="Another answer about different aspects."),
+        )
+
+        evaluated = session.metadata.get("evaluated_topic_ids", [])
+        asked = session.metadata.get("asked_topic_ids", [])
+
+        # asked includes the next question's topic, evaluated does not
+        assert len(evaluated) <= len(asked)
+
+        # Only 2 questions were answered, so at most 2 unique evaluated topics
+        assert len(evaluated) <= 2
+
+        # Each evaluated topic must have at least one evaluation
+        eval_history = session.metadata.get("evaluation_history", [])
+        evaluated_in_history = set(
+            e["competency_id"] for e in eval_history if isinstance(e, dict)
+        )
+        for tid in evaluated:
+            assert tid in evaluated_in_history
+

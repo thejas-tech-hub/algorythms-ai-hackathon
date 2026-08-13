@@ -441,12 +441,14 @@ class FinalReportGenerator:
         total_questions: int,
         duration_seconds: float,
         topics_covered: list[str],
+        topic_titles: dict[str, str] | None = None,
     ) -> FinalInterviewReport:
         """Aggregate ALL accumulated evidence into a FinalInterviewReport."""
 
         # ── Per-competency scoring ──────────────────────────────────
         competency_scores = _build_competency_scores(
-            competency_states, evaluation_history, plan_history
+            competency_states, evaluation_history, plan_history,
+            topic_titles=topic_titles or {},
         )
 
         # ── Overall score ───────────────────────────────────────────
@@ -615,8 +617,10 @@ def _build_competency_scores(
     competency_states: dict[str, CompetencyState],
     evaluation_history: list[AnswerEvaluation],
     plan_history: list[QuestionPlan],
+    topic_titles: dict[str, str] | None = None,
 ) -> list[CompetencyScore]:
     """Create CompetencyScore entries only from evaluated question plans."""
+    _titles = topic_titles or {}
     plan_by_id = {plan.plan_id: plan for plan in plan_history}
 
     evals_by_comp: dict[str, list[tuple[AnswerEvaluation, QuestionPlan]]] = {}
@@ -667,9 +671,12 @@ def _build_competency_scores(
             unique_misconceptions = list(dict.fromkeys(all_misconceptions))[:3]
             note_parts.append(f"Misconceptions: {', '.join(unique_misconceptions)}")
 
+        # RC-2 fix: Resolve name from topic_titles first, then plan display name
+        comp_name = _titles.get(comp_id) or _plan_display_name(latest_plan)
+
         scores.append(CompetencyScore(
             competency_id=comp_id,
-            competency_name=_plan_display_name(latest_plan),
+            competency_name=comp_name,
             category=CompetencyCategory.TECHNICAL,
             proficiency=proficiency,
             score=comp_score,
